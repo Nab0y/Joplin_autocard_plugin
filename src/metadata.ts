@@ -22,6 +22,44 @@ function readAttributes(tag: string): Map<string, string> {
 	return attributes;
 }
 
+function charsetFromContentType(value: string): string | undefined {
+	const match = /(?:^|;)\s*charset\s*=\s*(?:"([^"]*)"|'([^']*)'|([^;\s]+))/i.exec(value);
+	return match?.[1] ?? match?.[2] ?? match?.[3];
+}
+
+function decoderFor(label?: string): TextDecoder | undefined {
+	if (!label?.trim()) return undefined;
+	try {
+		return new TextDecoder(label);
+	} catch {
+		return undefined;
+	}
+}
+
+function decoderFromHtml(bytes: Uint8Array): TextDecoder | undefined {
+	// Encoding declarations are ASCII, so only inspect a short prefix before decoding the document.
+	const prefix = new TextDecoder().decode(bytes.subarray(0, 4096));
+	const pattern = /<!--[\s\S]*?(?:-->|$)|<meta\b(?:[^>"']|"[^"]*"|'[^']*')*>/gi;
+	let tag: RegExpExecArray | null;
+	while ((tag = pattern.exec(prefix))) {
+		if (tag[0].startsWith('<!--')) continue;
+		const attributes = readAttributes(tag[0]);
+		const legacy = attributes.get('http-equiv')?.toLowerCase() === 'content-type';
+		const label = attributes.get('charset') ?? (legacy ? charsetFromContentType(attributes.get('content') || '') : undefined);
+		const decoder = decoderFor(label);
+		if (decoder) return decoder.encoding.startsWith('utf-16') ? new TextDecoder() : decoder;
+	}
+	return undefined;
+}
+
+function decodeHtml(bytes: Uint8Array, contentType: string): string {
+	// Match browser precedence: BOM, then HTTP charset, then the HTML declaration.
+	if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) return new TextDecoder().decode(bytes);
+	if (bytes[0] === 0xff && bytes[1] === 0xfe) return new TextDecoder('utf-16le').decode(bytes);
+	if (bytes[0] === 0xfe && bytes[1] === 0xff) return new TextDecoder('utf-16be').decode(bytes);
+	return (decoderFor(charsetFromContentType(contentType)) ?? decoderFromHtml(bytes) ?? new TextDecoder()).decode(bytes);
+}
+
 function parseMetadata(html: string, url: URL, pageUrl: URL): CardMetadata {
 	const tags = new Map<string, string>();
 	const favicons: URL[] = [];
@@ -60,8 +98,10 @@ export async function fetchMetadata(url: URL): Promise<CardMetadata | undefined>
 	const timeout = setTimeout(() => controller.abort(), 10000);
 	try {
 		const response = await fetch(url.href, { signal: controller.signal });
-		if (!response.ok || !/^(text\/html|application\/xhtml\+xml)(?:;|$)/i.test(response.headers.get('content-type') || '')) return undefined;
-		return parseMetadata(await response.text(), url, httpUrl(response.url) || url);
+		const contentType = response.headers.get('content-type') || '';
+		if (!response.ok || !/^(text\/html|application\/xhtml\+xml)(?:;|$)/i.test(contentType)) return undefined;
+		const bytes = new Uint8Array(await response.arrayBuffer());
+		return parseMetadata(decodeHtml(bytes, contentType), url, httpUrl(response.url) || url);
 	} catch (error) {
 		console.warn('AutoCard could not fetch page metadata:', error);
 		return undefined;

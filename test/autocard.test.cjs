@@ -19,8 +19,8 @@ const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR
 
 function page(markup = `<meta content='images/cover.png' property='og:image'>
 <meta property="og:title" content="Project &quot;[demo]&quot;">
-<meta property="og:description" content="An &lt;example&gt; project">`) {
-	const response = new Response(markup, { headers: { 'content-type': 'text/html; charset=utf-8' } });
+<meta property="og:description" content="An &lt;example&gt; project">`, contentType = 'text/html; charset=utf-8') {
+	const response = new Response(markup, { headers: { 'content-type': contentType } });
 	Object.defineProperty(response, 'url', { value: 'https://example.com/projects/demo' });
 	return response;
 }
@@ -28,7 +28,7 @@ function page(markup = `<meta content='images/cover.png' property='og:image'>
 async function start(api, fetch) {
 	let script;
 	vm.runInNewContext(await bundle, {
-		URL, AbortController, setTimeout, clearTimeout, fetch, Buffer,
+		URL, TextDecoder, AbortController, setTimeout, clearTimeout, fetch, Buffer,
 		require: name => api.require ? api.require(name) : assert.fail(`Loaded a desktop dependency on mobile: ${name}`),
 		console: { warn() {} },
 		joplin: { ...api, plugins: { ...api.plugins, register(value) { script = value; } } },
@@ -226,6 +226,42 @@ test('legacy conversion does not replace the selection if it changed during a do
 	}, { commandName: 'autocardMakeSelectionOffline', selection: () => selection });
 	assert.equal(calls.inserted.length, 0);
 });
+
+// Bytes taken from the title and description tags of the reported Windows-1251 page.
+const cyrillicHtml = Buffer.concat([
+	Buffer.from('<title>F+ R570'),
+	Buffer.from('c5202d20cee1f1f3e6e4e5ede8e5', 'hex'),
+	Buffer.from(' - 4PDA</title><meta name="description" content="'),
+	Buffer.from('cee1f1f3e6e4e5ede8e520f3f1f2f0eee9f1f2e2e0', 'hex'),
+	Buffer.from('">'),
+]);
+
+for (const [name, type, head] of [
+	['HTTP charset', 'text/html; charset=windows-1251', '<meta charset="utf-8">'],
+	['HTML charset', 'text/html', '<meta charset="windows-1251">'],
+	['HTML http-equiv with an unknown HTTP charset', 'text/html; charset=unknown', '<meta content="text/html; charset=windows-1251" http-equiv="Content-Type">'],
+]) {
+	test(`reads Windows-1251 title and description from ${name}`, async t => {
+		const calls = await desktop(t, url => url === clipboardUrl
+			? page(Buffer.concat([Buffer.from(head), cyrillicHtml]), type)
+			: new Response(null, { status: 404 }));
+		const html = new MarkdownIt().render(calls.inserted[0]);
+		assert.match(html, /F\+ R570Е - Обсуждение - 4PDA/);
+		assert.match(html, /Обсуждение устройства/);
+		assert.doesNotMatch(html, /\uFFFD/);
+	});
+}
+
+for (const [name, markup, type] of [
+	['UTF-8 without a declared charset', '<!-- <meta charset="windows-1251"> --><title>Кириллица</title>', 'text/html'],
+	['UTF-8 BOM over a conflicting header', '\uFEFF<title>Кириллица</title>', 'text/html; charset=windows-1251'],
+	['UTF-16LE BOM over a conflicting header', Buffer.from('\uFEFF<title>Кириллица</title>', 'utf16le'), 'text/html; charset=utf-8'],
+]) {
+	test(`keeps Cyrillic intact for ${name}`, async t => {
+		const calls = await desktop(t, url => url === clipboardUrl ? page(markup, type) : new Response(null, { status: 404 }));
+		assert.match(calls.inserted[0], /Кириллица/);
+	});
+}
 
 test('failed page fetch falls back to the original URL', async t => {
 	const calls = await desktop(t, () => new Response(null, { status: 403 }));
